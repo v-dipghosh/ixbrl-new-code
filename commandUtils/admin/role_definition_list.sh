@@ -1,0 +1,1 @@
+az cosmosdb sql role definition list --resource-group "${resource_group}" --account-name $cosmos
