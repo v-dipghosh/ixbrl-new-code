@@ -55,3 +55,7 @@ beautifulsoup4   # For parsing HTML
 lxml             # Optional but makes BeautifulSoup faster and more robust
 azure-storage-blob  # For accessing Azure Blob Storage
 beautifulsoup4
+lxml             # Optional but makes BeautifulSoup faster and more robust
+azure-storage-blob  # For accessing Azure Blob Storage
+python-Levenshtein
+html2image

@@ -5,14 +5,11 @@ import json
 import io
 import os
 import pandas as pd
-import re
 from utils.prompts import load_prompts
-from utils.blob_functions import get_blob_content, write_to_blob, list_blobs
+from utils.blob_functions import get_blob_content, write_to_blob
 from utils.azure_openai import run_prompt
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone
-import Levenshtein
-from typing import Tuple
  
 # Define batch size (adjust based on LLM token limits)
 BATCH_SIZE = 10
@@ -47,7 +44,7 @@ def process_blob(blob):
             df_filing_details = pd.read_excel(xls, sheet_name='Filing Details')
  
             # Extract relevant columns for LLM validation
-            df = df_filing_details[['Line Item Description', 'Concept Label', 'Comment Text','Dimensions','Tag Value']].dropna(how='all')
+            df = df_filing_details[['Line Item Description', 'Concept Label', 'Comment Text','Dimensions']].dropna(how='all')
  
             # Extract unique 'Period' values
             if 'Period' in df_filing_details.columns:
@@ -71,117 +68,32 @@ def process_blob(blob):
                     logging.warning(f"'Filing Information' sheet is empty in blob {blob_name}")
             else:
                 logging.warning(f"'Filing Information' sheet missing in blob {blob_name}")
-
+       
         elif ext == '.html':
             try:
-
                 soup = BeautifulSoup(blob_bytes.decode('utf-8', errors='ignore'), 'html.parser')
-                full_text = []
-
-                # --------------------------
-
-                # Statement of Compliance
-
-                # --------------------------
+ 
                 start_tag = None
                 for p in soup.find_all("p"):
                     if "STATEMENT OF COMPLIANCE" in p.get_text(strip=True).upper():
                         start_tag = p
-                        break      
+                        break
+ 
                 content = []
-
                 if start_tag:
                     current = start_tag
                     while current:
                         text = current.get_text(strip=True)
                         if text.startswith("2.") and "ACCOUNTING POLICIES" in text.upper():
                             break
-
                         if text:
                             content.append(text)
                         current = current.find_next_sibling("p")
-        
-                if content:
-                    full_text.append("=== STATEMENT OF COMPLIANCE ===")
-                    full_text.extend(content)
-        
-                # --------------------------
-                # NOTES TO THE FINANCIAL STATEMENTS (all occurrences)
-                # --------------------------
-
-                notes_occurrences = []
-                for p in soup.find_all("p"):
-                    if "NOTES TO THE FINANCIAL STATEMENTS" in p.get_text(strip=True).upper():
-                        notes_occurrences.append(p)
-        
-                for idx, start_tag in enumerate(notes_occurrences, start=1):
-                    notes_content = []
-                    current = start_tag
-                    while current:
-                        text = current.get_text(strip=True)
-
-                        if any(stop in text.upper() for stop in ["ACCOUNTING POLICIES", "DIRECTORS", "INDEPENDENT AUDITOR"]):
-                            break
-                        if text:
-                            notes_content.append(text)
-                        current = current.find_next_sibling("p")
-
-                    if notes_content:
-                        full_text.append(f"=== NOTES TO FS occurrence {idx} ===")
-                        full_text.extend(notes_content)
-        
-                # --------------------------
-                # Factors affecting tax charge for the year
-                # --------------------------
-                tax_section = []
-                start_tag = None
-                for p in soup.find_all("p"):
-                    if "FACTORS AFFECTING TAX" in p.get_text(strip=True).upper():
-                        start_tag = p
-                        break
-                if start_tag:
-                    current = start_tag
-                    while current:
-                        text = current.get_text(strip=True)
-                        if any(stop in text.upper() for stop in ["NOTES TO THE", "DIRECTORS", "INDEPENDENT AUDITOR"]):
-                            break
-                        if text:
-                            tax_section.append(text)
-                        current = current.find_next_sibling("p")        
-                if tax_section:
-                    full_text.append("=== FACTORS AFFECTING TAX ===")
-                    full_text.extend(tax_section)        
-                # --------------------------
-                # Save everything in one field
-                # --------------------------
-                result["statement_of_compliance_text"] = "\n".join(full_text)
-        
+ 
+                result["statement_of_compliance_text"] = "\n".join(content)
+ 
             except Exception as e:
                 result["error"] = f"Error extracting HTML content from {blob_name}: {str(e)}"
-            
-            #     soup = BeautifulSoup(blob_bytes.decode('utf-8', errors='ignore'), 'html.parser')
- 
-            #     start_tag = None
-            #     for p in soup.find_all("p"):
-            #         if "STATEMENT OF COMPLIANCE" in p.get_text(strip=True).upper():
-            #             start_tag = p
-            #             break
- 
-            #     content = []
-            #     if start_tag:
-            #         current = start_tag
-            #         while current:
-            #             text = current.get_text(strip=True)
-            #             if text.startswith("2.") and "ACCOUNTING POLICIES" in text.upper():
-            #                 break
-            #             if text:
-            #                 content.append(text)
-            #             current = current.find_next_sibling("p")
- 
-            #     result["statement_of_compliance_text"] = "\n".join(content)
- 
-            # except Exception as e:
-            #     result["error"] = f"Error extracting HTML content from {blob_name}: {str(e)}"
  
     except Exception as e:
         result["error"] = f"Error processing blob {blob_name}: {str(e)}"
@@ -246,12 +158,9 @@ def validate_taxonomy_with_llm(taxonomy_data):
     taxonomy_prompt = prompts["taxonomy"]
  
     try:
-        # logging.info(f"TAXANOMY DATA:  {taxonomy_data}")
         user_prompt = taxonomy_prompt.format(data=json.dumps(taxonomy_data, indent=2))
-        # logging.info(f'HTML --> {user_prompt}')
- 
         response = run_prompt(system_prompt, user_prompt).strip()
-        logging.info(f'TAXANOMY LLM RESPONSE:{response}')
+        logging.info(f'TAXANOMY:{response}')
  
         # Clean LLM formatting
         if response.startswith("```json"):
@@ -299,82 +208,28 @@ def validate_periods_with_llm(unique_periods, input_dates):
         logging.error(f"Period validation LLM processing error: {str(e)}")
         return [{"error": f"Period validation failed: {str(e)}"}]
  
-def concept_label_filter(excel_rows, matched_taxonomy_blob_name):
-    """Filter excel rows based on concept label match with taxonomy file."""
-    try:
-        taxonomy_bytes = get_blob_content("taxanomy", matched_taxonomy_blob_name)
-        xls = pd.ExcelFile(io.BytesIO(taxonomy_bytes))
- 
-        if "Presentation" not in xls.sheet_names:
-            logging.warning(f"'Presentation' sheet not found in {matched_taxonomy_blob_name}")
-            return excel_rows, []
- 
-        presentation_df = pd.read_excel(xls, sheet_name="Presentation")
-        if "Label" not in presentation_df.columns:
-            logging.warning(f"'Label' column not found in Presentation sheet of {matched_taxonomy_blob_name}")
-            return excel_rows, []
- 
-        labels_set = set(presentation_df["Label"].dropna().astype(str).str.strip())
- 
-        matched_rows = []
-        unmatched_rows = []
- 
-        for row in excel_rows:
-            concept = str(row.get("Concept Label", "")).strip()
-            # logging.info(f"Checking CONCEPT LABEL FROM SILVER '{concept}'")
- 
-            if concept in labels_set:
-                matched_rows.append(row)
-            else:
-                unmatched_rows.append(row)
- 
- 
-        logging.info(f"✅ {len(matched_rows)} rows matched from {matched_taxonomy_blob_name}")
-        # logging.info(f"{matched_rows} : MATCHED LABEL")
- 
-        logging.warning(f"⚠️ {len(unmatched_rows)} rows did not match in Presentation sheet from {matched_taxonomy_blob_name}")
-        # logging.warning(f"⚠️ {unmatched_rows} : UNMATCHED LABEL")
- 
-        return matched_rows, unmatched_rows
- 
-    except Exception as e:
-        logging.error(f"Failed concept_label_filter for {matched_taxonomy_blob_name}: {str(e)}")
-        return excel_rows, []
-   
-def normalize_taxonomy_name(taxonomy_name: str) -> Tuple[str, str]:
-    taxonomy_name = taxonomy_name.lower()
- 
-    if "frs 101" in taxonomy_name:
-        taxonomy_type = "frs-101"
-    elif "frs 102" in taxonomy_name:
-        taxonomy_type = "frs-102"
-    elif "ifrs" in taxonomy_name:
-        taxonomy_type = "ifrs"
-    else:
-        taxonomy_type = taxonomy_name
- 
-    if any(keyword in taxonomy_name for keyword in ["ireland", "irish"]):
-        jurisdiction = "ireland"
-    elif any(keyword in taxonomy_name for keyword in ["uk", "frc", "united kingdom"]):
-        jurisdiction = "uk"
-    else:
-        jurisdiction = taxonomy_name
- 
-    return taxonomy_type, jurisdiction
  
 def _main_logic(req: func.HttpRequest) -> func.HttpResponse:
     logging.info('Python HTTP trigger function processed a request.')
- 
-    # 🔍 List all taxonomy files in taxonomy container
-    taxonomy_blobs = list_blobs("taxanomy")
-    taxonomy_blobs_list = list(taxonomy_blobs)  # convert iterable to list for reuse
-    logging.info("📁 Listing blobs in 'taxanomy' container:")
-    for blob in taxonomy_blobs_list:
-        logging.info(f"🗂️ {blob.name}")
- 
+   
     req_body = req.get_json()
     selected_blobs = req_body.get("blobs", None)
     input_dates = req_body.get("selectedDates", [])
+ 
+    # input_dates = req_body.get("input_dates", [])  # Expecting UI to send dates here
+    # input_dates = {
+    # "end_date_current": "2023-12-31",
+    # "duration_current": {
+    #     "start": "2023-01-01",
+    #     "end": "2023-12-31"
+    # },
+    # "end_date_prior": "2022-12-31",
+    # "duration_prior": {
+    #     "start": "2022-01-01",
+    #     "end": "2022-12-31"
+    # },
+    # "opening_date_prior": "2021-12-31"
+    # }
  
     if not selected_blobs:
         return func.HttpResponse(
@@ -389,44 +244,39 @@ def _main_logic(req: func.HttpRequest) -> func.HttpResponse:
  
     with ThreadPoolExecutor(max_workers=8) as executor:
         futures = [executor.submit(process_blob, blob) for blob in selected_blobs]
+    #     for future in as_completed(futures):
+    #         res = future.result()
+    #         if res["error"]:
+    #             errors.append(res["error"])
+    #         if res["excel_rows"]:
+    #             validated_data.extend(validate_with_llm(res["excel_rows"]))
+    #         if res["taxonomy_data"]:
+    #             taxonomy_data_to_validate.extend(res["taxonomy_data"])
  
+    # if taxonomy_data_to_validate:
+    #     validated_data.append(validate_taxonomy_with_llm(taxonomy_data_to_validate))
+    # else:
+    #     logging.warning("No taxonomy data found across all blobs.")
+        # First: collect all data from blobs
         blob_results = []
         all_periods = []
- 
- 
         for future in as_completed(futures):
             res = future.result()
             blob_results.append(res)
- 
-            # LLM input prep (leave as is)
+            if res["error"]:
+                errors.append(res["error"])
             if res["taxonomy_data"]:
                 taxonomy_data_to_validate.extend(res["taxonomy_data"])
+                # Inject HTML 'Statement of Compliance' into taxonomy validation
             if res.get("statement_of_compliance_text"):
                 taxonomy_data_to_validate.append({
                     "source": "html_statement_of_compliance",
                     "content": res["statement_of_compliance_text"]
                 })
-           
-            if res["error"]:
-                errors.append(res["error"])
             all_periods.extend(res.get("unique_periods", []))
  
+ 
         # first: validate taxonomy first
-        # logging.warning(f"Taxonomy Name Extracted: {next((entry['SWL'] for entry in taxonomy_data_to_validate if entry.get('Filer Name') == 'Taxonomy Name'), None)}")
-        # logging.warning(f"Taxonomy Data to Validate: {taxonomy_data_to_validate}")
-       
-        # extract taxonomy name dynamically regardless of structure
-        taxonomy_name = None
-        for row in taxonomy_data_to_validate:
-            if row.get("Filer Name") == "Taxonomy Name":
-                # Get the first value that is NOT 'Filer Name'
-                taxonomy_name = next((v for k, v in row.items() if k != "Filer Name"), None)
-                break
- 
-        logging.warning(f"📘 Taxonomy Name Extracted: {taxonomy_name}")
- 
-        logging.info(f"DATA SENT FOR TAXANOMY VALIDATION----> {taxonomy_data_to_validate}")
- 
         if taxonomy_data_to_validate:
             taxonomy_result = validate_taxonomy_with_llm(taxonomy_data_to_validate)
             validated_data.append({"taxonomy_validation": taxonomy_result})
@@ -440,64 +290,11 @@ def _main_logic(req: func.HttpRequest) -> func.HttpResponse:
             logging.warning("No input dates provided for period validation.")
  
         # Third: now validate Excel rows after taxonomy is validated
- 
-        # for res in blob_results:
-        #     if res["excel_rows"]:
-        #         validated_data.extend(validate_with_llm(res["excel_rows"]))
- 
-        # Dynamically match taxonomy_name to available files in taxanomy container
- 
-        matched_taxonomy_file = None
- 
-        if taxonomy_name:
-            taxonomy_type, jurisdiction = normalize_taxonomy_name(taxonomy_name)
-            logging.info(f"🔍 Normalized taxonomy_type: {taxonomy_type}, jurisdiction: {jurisdiction}")
- 
-            def is_valid_candidate(file):
-                fname = file.name.lower()
-                if jurisdiction.lower() in ["irish", "ireland"]:
-                    return "ireland-frs-2023" in fname
-                elif jurisdiction.lower() in ["uk", "frc", "united kingdom"]:
-                    return "frc-2023" in fname
-                return False
- 
-            valid_candidates = [b for b in taxonomy_blobs_list if is_valid_candidate(b)]
-            best_score = 0
- 
-            for blob in valid_candidates:
-                filename = blob.name.lower()
-                score = 5 if taxonomy_type in filename else 0
-                score += 5 - min(Levenshtein.distance(taxonomy_type, filename), 5)  # Fuzzy match on taxonomy_type
- 
-                if score > best_score:
-                    best_score = score
-                    matched_taxonomy_file = blob.name
-
-        logging.warning(f"MATCHED TAXANOMY FILE: {matched_taxonomy_file}")
-       
         for res in blob_results:
             if res["excel_rows"]:
-                # matched_file = "FRC-2023-v1.0.1-FRS-101.xlsx"
-                matched_file = matched_taxonomy_file
-                if matched_file:
-                    filtered_rows, unmatched_rows = concept_label_filter(res["excel_rows"], matched_file)
-                    # logging.info(f"MATCHED TAXANOMY FILE -----> {matched_taxonomy_file}")
-                    logging.info(f"LLM KO MATCHED CONCEPT LABELS BHEJRE --> {len(filtered_rows)}")
-                    validated_data.extend(validate_with_llm(filtered_rows))
+                validated_data.extend(validate_with_llm(res["excel_rows"]))
  
-                    if unmatched_rows:
-                        # logging.warning(f"⚠️ {len(unmatched_rows)} unmatched Concept Labels in {res['blob_name']}")
-                                        # Add unmatched concept labels with validation message
-                        for row in unmatched_rows:
-                            validated_data.append({
-                                "Concept Label": row.get("Concept Label"),
-                                "validation_result": [{ "status": "FLAGGED FOR REVIEW","reason": "Concept Label not found in matched taxonomy file"}]
-                            })
  
-                else:
-                    logging.warning(f"❌ No matched taxonomy file found for {res['blob_name']}. Sending all rows to LLM.")
-                    # validated_data.extend(validate_with_llm(res["excel_rows"]))
-
     # Validate JSON
     try:
         json.dumps(validated_data)
@@ -512,7 +309,11 @@ def _main_logic(req: func.HttpRequest) -> func.HttpResponse:
     # Save to blob
     # output_name = "validated-output.json"
  
-# Use first blob name for output naming
+    # timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S")
+    # output_name = f"validated-output-{timestamp}.json"
+    # write_to_blob("gold", output_name, json.dumps(validated_data, indent=2).encode('utf-8'))
+
+    # Use first blob name for output naming
     first_blob_name = selected_blobs[0]["name"]
     base_filename = os.path.splitext(os.path.basename(first_blob_name))[0]
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S")

@@ -13,9 +13,58 @@ from bs4 import BeautifulSoup
 from datetime import datetime, timezone
 import Levenshtein
 from typing import Tuple
- 
+from html2image import Html2Image
+import tempfile
+import base64
+
+
 # Define batch size (adjust based on LLM token limits)
 BATCH_SIZE = 10
+
+def convert_html_to_images(html_bytes, html_blob_name):
+    """
+    Converts full HTML to multiple page images.
+    Returns { page_number: image_bytes }.
+    """
+    try:
+        html_content = html_bytes.decode('utf-8', errors='ignore')
+
+        hti = Html2Image()
+        image_map = {}
+
+        with tempfile.TemporaryDirectory() as tmpdirname:
+            hti.output_path = tmpdirname
+
+            base_name = os.path.splitext(os.path.basename(html_blob_name))[0]
+            timestamp = datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
+            image_prefix = f"{base_name}_{timestamp}_page"
+
+            hti.screenshot(
+                html_str=html_content,
+                save_as=f"{image_prefix}.png",
+                size=(1200, 1600),
+                browser_width=1200
+            )
+
+            files = sorted(
+                f for f in os.listdir(tmpdirname)
+                if f.startswith(image_prefix) and f.endswith(".png")
+            )
+
+            for i, filename in enumerate(files):
+                page_number = i + 1
+                local_path = os.path.join(tmpdirname, filename)
+
+                with open(local_path, "rb") as f:
+                    image_bytes = f.read()
+
+                image_map[page_number] = image_bytes
+
+        return image_map
+
+    except Exception as e:
+        logging.error(f"❌ Error in convert_html_to_images: {str(e)}")
+        return {}
  
 def process_blob(blob):
     """Extract relevant Excel content for LLM validation."""
@@ -23,7 +72,7 @@ def process_blob(blob):
     container_name = blob.get("container", "silver")
     # result = {"blob_name": blob_name, "excel_rows": [], "error": None}
     # result = {"blob_name": blob_name, "excel_rows": [], "taxonomy_data": None, "error": None}
-    result = {"blob_name": blob_name, "excel_rows": [], "taxonomy_data": [],"unique_periods": [],"statement_of_compliance_text": None, "error": None}
+    result = {"blob_name": blob_name, "excel_rows": [], "taxonomy_data": [],"unique_periods": [],"statement_of_compliance_text": None, "error": None,"html_page_images":[],"html_file_hash":None}
  
  
     if not blob_name:
@@ -47,8 +96,31 @@ def process_blob(blob):
             df_filing_details = pd.read_excel(xls, sheet_name='Filing Details')
  
             # Extract relevant columns for LLM validation
-            df = df_filing_details[['Line Item Description', 'Concept Label', 'Comment Text','Dimensions','Tag Value']].dropna(how='all')
- 
+            df = df_filing_details[['Line Item Description', 'Concept Label', 'Comment Text','Dimensions','Tag Value','Page Number']].dropna(how='all')
+            # Clean Page Number column if present
+            if 'Page Number' in df.columns:
+                def clean_page_number(val):
+                    import ast
+                    try:
+                        if isinstance(val, list):
+                            return val[0] if val else None
+                        if isinstance(val, str):
+                            val = val.strip()
+                            if val.startswith("[") and val.endswith("]"):
+                                parsed = ast.literal_eval(val)
+                                if isinstance(parsed, list) and parsed:
+                                    return int(parsed[0])
+                            elif val.isdigit():
+                                return int(val)
+                        if isinstance(val, float):
+                            return int(val)
+                        if isinstance(val, int):
+                            return val
+                        return None
+                    except Exception:
+                        return None
+
+                df['Page Number'] = df['Page Number'].apply(clean_page_number)
             # Extract unique 'Period' values
             if 'Period' in df_filing_details.columns:
                 unique_periods = df_filing_details['Period'].dropna().unique().tolist()
@@ -59,6 +131,7 @@ def process_blob(blob):
                 logging.info(f"[{blob_name}] Extracted Periods from Excel: {unique_periods}")
  
             result["excel_rows"] = df.to_dict(orient='records')
+
             result["unique_periods"] = unique_periods
  
             # taxonomy_df = pd.read_excel(xls, sheet_name='Filing Information')
@@ -71,117 +144,37 @@ def process_blob(blob):
                     logging.warning(f"'Filing Information' sheet is empty in blob {blob_name}")
             else:
                 logging.warning(f"'Filing Information' sheet missing in blob {blob_name}")
-
+       
         elif ext == '.html':
             try:
-
                 soup = BeautifulSoup(blob_bytes.decode('utf-8', errors='ignore'), 'html.parser')
-                full_text = []
-
-                # --------------------------
-
-                # Statement of Compliance
-
-                # --------------------------
+ 
                 start_tag = None
                 for p in soup.find_all("p"):
                     if "STATEMENT OF COMPLIANCE" in p.get_text(strip=True).upper():
                         start_tag = p
-                        break      
+                        break
+ 
                 content = []
-
                 if start_tag:
                     current = start_tag
                     while current:
                         text = current.get_text(strip=True)
                         if text.startswith("2.") and "ACCOUNTING POLICIES" in text.upper():
                             break
-
                         if text:
                             content.append(text)
                         current = current.find_next_sibling("p")
-        
-                if content:
-                    full_text.append("=== STATEMENT OF COMPLIANCE ===")
-                    full_text.extend(content)
-        
-                # --------------------------
-                # NOTES TO THE FINANCIAL STATEMENTS (all occurrences)
-                # --------------------------
+ 
+                result["statement_of_compliance_text"] = "\n".join(content)
 
-                notes_occurrences = []
-                for p in soup.find_all("p"):
-                    if "NOTES TO THE FINANCIAL STATEMENTS" in p.get_text(strip=True).upper():
-                        notes_occurrences.append(p)
-        
-                for idx, start_tag in enumerate(notes_occurrences, start=1):
-                    notes_content = []
-                    current = start_tag
-                    while current:
-                        text = current.get_text(strip=True)
+        # 📸 Convert HTML to images
+                logging.warning(f"🚀 Converting HTML to images for blob: {blob_name}")
+                page_images = convert_html_to_images(blob_bytes, blob_name)
+                result["html_page_images"] = page_images
 
-                        if any(stop in text.upper() for stop in ["ACCOUNTING POLICIES", "DIRECTORS", "INDEPENDENT AUDITOR"]):
-                            break
-                        if text:
-                            notes_content.append(text)
-                        current = current.find_next_sibling("p")
-
-                    if notes_content:
-                        full_text.append(f"=== NOTES TO FS occurrence {idx} ===")
-                        full_text.extend(notes_content)
-        
-                # --------------------------
-                # Factors affecting tax charge for the year
-                # --------------------------
-                tax_section = []
-                start_tag = None
-                for p in soup.find_all("p"):
-                    if "FACTORS AFFECTING TAX" in p.get_text(strip=True).upper():
-                        start_tag = p
-                        break
-                if start_tag:
-                    current = start_tag
-                    while current:
-                        text = current.get_text(strip=True)
-                        if any(stop in text.upper() for stop in ["NOTES TO THE", "DIRECTORS", "INDEPENDENT AUDITOR"]):
-                            break
-                        if text:
-                            tax_section.append(text)
-                        current = current.find_next_sibling("p")        
-                if tax_section:
-                    full_text.append("=== FACTORS AFFECTING TAX ===")
-                    full_text.extend(tax_section)        
-                # --------------------------
-                # Save everything in one field
-                # --------------------------
-                result["statement_of_compliance_text"] = "\n".join(full_text)
-        
             except Exception as e:
                 result["error"] = f"Error extracting HTML content from {blob_name}: {str(e)}"
-            
-            #     soup = BeautifulSoup(blob_bytes.decode('utf-8', errors='ignore'), 'html.parser')
- 
-            #     start_tag = None
-            #     for p in soup.find_all("p"):
-            #         if "STATEMENT OF COMPLIANCE" in p.get_text(strip=True).upper():
-            #             start_tag = p
-            #             break
- 
-            #     content = []
-            #     if start_tag:
-            #         current = start_tag
-            #         while current:
-            #             text = current.get_text(strip=True)
-            #             if text.startswith("2.") and "ACCOUNTING POLICIES" in text.upper():
-            #                 break
-            #             if text:
-            #                 content.append(text)
-            #             current = current.find_next_sibling("p")
- 
-            #     result["statement_of_compliance_text"] = "\n".join(content)
- 
-            # except Exception as e:
-            #     result["error"] = f"Error extracting HTML content from {blob_name}: {str(e)}"
  
     except Exception as e:
         result["error"] = f"Error processing blob {blob_name}: {str(e)}"
@@ -193,51 +186,67 @@ def batch_rows(rows, batch_size):
     for i in range(0, len(rows), batch_size):
         yield rows[i:i + batch_size]
  
-def validate_with_llm(rows):
-    """Send batches of rows to LLM for validation."""
+def validate_with_llm(rows, html_images=None):
+    """Send batches of rows to LLM for validation with optional image context."""
     validated_rows = []
-    prompts = load_prompts()  
+    prompts = load_prompts()
     system_prompt = prompts["system_prompt"]
-    user_prompt_template = prompts["user_prompt"]  
- 
+    user_prompt_template = prompts["user_prompt"]
+
+    html_images = html_images or {}
+
+    # Attach base64 image (if any) to each row by matching Page Number
+    for row in rows:
+        page_number = row.get("Page Number")
+
+        # 🔐 Defensive: ensure it's hashable
+        try:
+            # If it's a list, grab the first element
+            if isinstance(page_number, list):
+                logging.warning(f"🧯 Page Number is a list: {page_number}")
+                page_number = page_number[0] if page_number else None
+
+            # If it's float like 1.0, convert to int
+            elif isinstance(page_number, float):
+                page_number = int(page_number)
+
+            # Finally, try to access the image using the normalized key
+            if html_images and page_number in html_images:
+                image_bytes = html_images[page_number]
+                row["page_image_base64"] = base64.b64encode(image_bytes).decode("utf-8")
+
+        except TypeError as e:
+            logging.error(f"❌ Unhashable Page Number: {page_number} in row: {row}")
+
     for batch in batch_rows(rows, BATCH_SIZE):
-        # Use the user prompt from backend instead of constructing it manually
         user_prompt = user_prompt_template.format(data=json.dumps(batch, indent=2))
- 
         response = run_prompt(system_prompt, user_prompt)
+        
         try:
             response = response.strip()
- 
-            # Handle Markdown formatting from LLM like ```json ... ```
             if response.startswith("```json"):
                 response = response.strip("`").replace("json", "", 1).strip()
             elif response.startswith("```"):
                 response = response.strip("`").strip()
- 
-            # Ensure it's still a string before proceeding
+
             if not isinstance(response, str):
-                logging.error("LLM response is not a valid string.")
                 validated_rows.append({"error": "Invalid LLM response type"})
                 continue
- 
+
             if not response.startswith("[") and not response.startswith("{"):
-                logging.error("LLM response is not valid JSON format")
                 validated_rows.append({"error": "Invalid JSON format from LLM"})
                 continue
- 
+
             parsed_response = json.loads(response)
- 
-            # Optional: skip if it's [{}] or [{}] * n
+
             if isinstance(parsed_response, list) and all(isinstance(item, dict) and not item for item in parsed_response):
-                logging.warning("Skipping empty [{}] response from LLM")
                 continue
-            logging.info(f'ROW BY ROW VALIDATION --> : {parsed_response}')
+
             validated_rows.extend(parsed_response)
- 
+
         except json.JSONDecodeError as e:
-            logging.error(f"JSON parsing error: {str(e)}")
             validated_rows.append({"error": f"Invalid JSON format from LLM: {str(e)}"})
- 
+
     return validated_rows
  
 def validate_taxonomy_with_llm(taxonomy_data):
@@ -248,10 +257,10 @@ def validate_taxonomy_with_llm(taxonomy_data):
     try:
         # logging.info(f"TAXANOMY DATA:  {taxonomy_data}")
         user_prompt = taxonomy_prompt.format(data=json.dumps(taxonomy_data, indent=2))
-        # logging.info(f'HTML --> {user_prompt}')
+        logging.info(f'HTML --> {user_prompt}')
  
         response = run_prompt(system_prompt, user_prompt).strip()
-        logging.info(f'TAXANOMY LLM RESPONSE:{response}')
+        logging.info(f'TAXANOMY:{response}')
  
         # Clean LLM formatting
         if response.startswith("```json"):
@@ -413,9 +422,9 @@ def _main_logic(req: func.HttpRequest) -> func.HttpResponse:
  
         # first: validate taxonomy first
         # logging.warning(f"Taxonomy Name Extracted: {next((entry['SWL'] for entry in taxonomy_data_to_validate if entry.get('Filer Name') == 'Taxonomy Name'), None)}")
-        # logging.warning(f"Taxonomy Data to Validate: {taxonomy_data_to_validate}")
+        logging.warning(f"Taxonomy Data to Validate: {taxonomy_data_to_validate}")
        
-        # extract taxonomy name dynamically regardless of structure
+# extract taxonomy name dynamically regardless of structure
         taxonomy_name = None
         for row in taxonomy_data_to_validate:
             if row.get("Filer Name") == "Taxonomy Name":
@@ -423,9 +432,9 @@ def _main_logic(req: func.HttpRequest) -> func.HttpResponse:
                 taxonomy_name = next((v for k, v in row.items() if k != "Filer Name"), None)
                 break
  
-        logging.warning(f"📘 Taxonomy Name Extracted: {taxonomy_name}")
+        logging.info(f"📘 Taxonomy Name Extracted: {taxonomy_name}")
  
-        logging.info(f"DATA SENT FOR TAXANOMY VALIDATION----> {taxonomy_data_to_validate}")
+        logging.info(f"HTML DATA ----> {taxonomy_data_to_validate}")
  
         if taxonomy_data_to_validate:
             taxonomy_result = validate_taxonomy_with_llm(taxonomy_data_to_validate)
@@ -472,31 +481,36 @@ def _main_logic(req: func.HttpRequest) -> func.HttpResponse:
                 if score > best_score:
                     best_score = score
                     matched_taxonomy_file = blob.name
-
-        logging.warning(f"MATCHED TAXANOMY FILE: {matched_taxonomy_file}")
+ 
+ 
+        logging.warning(f"DHOOM MACHALE: {matched_taxonomy_file}")
+ 
        
         for res in blob_results:
             if res["excel_rows"]:
-                # matched_file = "FRC-2023-v1.0.1-FRS-101.xlsx"
                 matched_file = matched_taxonomy_file
+                html_images = res.get("html_page_images", {})  # 🔥 grab the in-memory images
+
                 if matched_file:
                     filtered_rows, unmatched_rows = concept_label_filter(res["excel_rows"], matched_file)
-                    # logging.info(f"MATCHED TAXANOMY FILE -----> {matched_taxonomy_file}")
                     logging.info(f"LLM KO MATCHED CONCEPT LABELS BHEJRE --> {len(filtered_rows)}")
-                    validated_data.extend(validate_with_llm(filtered_rows))
- 
+                    logging.info(f"HTML_IMAGES--->",{html_images})
+                    
+                    # validated_data.extend(validate_with_llm(filtered_rows, html_images))  # 🔥 pass html images
+
                     if unmatched_rows:
-                        # logging.warning(f"⚠️ {len(unmatched_rows)} unmatched Concept Labels in {res['blob_name']}")
-                                        # Add unmatched concept labels with validation message
                         for row in unmatched_rows:
                             validated_data.append({
                                 "Concept Label": row.get("Concept Label"),
-                                "validation_result": [{ "status": "FLAGGED FOR REVIEW","reason": "Concept Label not found in matched taxonomy file"}]
+                                "validation_result": [{ 
+                                    "status": "FLAGGED FOR REVIEW",
+                                    "reason": "Concept Label not found in matched taxonomy file"
+                                }]
                             })
- 
                 else:
                     logging.warning(f"❌ No matched taxonomy file found for {res['blob_name']}. Sending all rows to LLM.")
-                    # validated_data.extend(validate_with_llm(res["excel_rows"]))
+                    validated_data.extend(validate_with_llm(res["excel_rows"], html_images))  # still pass images
+
 
     # Validate JSON
     try:
