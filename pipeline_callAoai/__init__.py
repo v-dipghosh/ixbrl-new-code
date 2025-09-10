@@ -193,53 +193,189 @@ def batch_rows(rows, batch_size):
     for i in range(0, len(rows), batch_size):
         yield rows[i:i + batch_size]
  
+# def validate_with_llm(rows):
+#     """Send batches of rows to LLM for validation."""
+#     validated_rows = []
+#     prompts = load_prompts()  
+#     system_prompt = prompts["system_prompt"]
+#     user_prompt_template = prompts["user_prompt"]  
+ 
+#     for batch in batch_rows(rows, BATCH_SIZE):
+#         # Use the user prompt from backend instead of constructing it manually
+#         user_prompt = user_prompt_template.format(data=json.dumps(batch, indent=2))
+ 
+#         response = run_prompt(system_prompt, user_prompt)
+#         try:
+#             response = response.strip()
+ 
+#             # Handle Markdown formatting from LLM like ```json ... ```
+#             if response.startswith("```json"):
+#                 response = response.strip("`").replace("json", "", 1).strip()
+#             elif response.startswith("```"):
+#                 response = response.strip("`").strip()
+ 
+#             # Ensure it's still a string before proceeding
+#             if not isinstance(response, str):
+#                 logging.error("LLM response is not a valid string.")
+#                 validated_rows.append({"error": "Invalid LLM response type"})
+#                 continue
+ 
+#             if not response.startswith("[") and not response.startswith("{"):
+#                 logging.error("LLM response is not valid JSON format")
+#                 validated_rows.append({"error": "Invalid JSON format from LLM"})
+#                 continue
+ 
+#             parsed_response = json.loads(response)
+ 
+#             # Optional: skip if it's [{}] or [{}] * n
+#             if isinstance(parsed_response, list) and all(isinstance(item, dict) and not item for item in parsed_response):
+#                 logging.warning("Skipping empty [{}] response from LLM")
+#                 continue
+#             logging.info(f'ROW BY ROW VALIDATION --> : {parsed_response}')
+#             validated_rows.extend(parsed_response)
+ 
+#         except json.JSONDecodeError as e:
+#             logging.error(f"JSON parsing error: {str(e)}")
+#             validated_rows.append({"error": f"Invalid JSON format from LLM: {str(e)}"})
+ 
+#     return validated_rows
+
+# from utils.validators import (
+#     has_url, has_common_word, looks_like_date, is_numeric_only
+# )
+
 def validate_with_llm(rows):
-    """Send batches of rows to LLM for validation."""
+    """
+    Apply deterministic rules first, then send whatever is unresolved to the LLM.
+    Output schema matches your local validate.py:
+      keys: "Line Item Description", "Concept label", "Comment Text", "Dimensions", "Tag Value",
+            "Validation": {"status": "<MATCH|MISSING_DATA|FLAGGED_FOR_REVIEW>", "reason": "..."}
+    """
     validated_rows = []
-    prompts = load_prompts()  
+    pass_through = []
+
+    prompts = load_prompts()
     system_prompt = prompts["system_prompt"]
-    user_prompt_template = prompts["user_prompt"]  
- 
-    for batch in batch_rows(rows, BATCH_SIZE):
-        # Use the user prompt from backend instead of constructing it manually
-        user_prompt = user_prompt_template.format(data=json.dumps(batch, indent=2))
- 
-        response = run_prompt(system_prompt, user_prompt)
-        try:
-            response = response.strip()
- 
-            # Handle Markdown formatting from LLM like ```json ... ```
-            if response.startswith("```json"):
-                response = response.strip("`").replace("json", "", 1).strip()
-            elif response.startswith("```"):
-                response = response.strip("`").strip()
- 
-            # Ensure it's still a string before proceeding
-            if not isinstance(response, str):
-                logging.error("LLM response is not a valid string.")
-                validated_rows.append({"error": "Invalid LLM response type"})
+    user_prompt_template = prompts["user_prompt"]
+
+    for row in rows:
+        concept = row.get("Concept Label") or ""
+        lid     = row.get("Line Item Description") or ""
+        dims    = row.get("Dimensions") or ""
+        tag     = row.get("Tag Value")
+        tag_str = "" if tag is None else str(tag)
+
+        lid_present = bool(str(lid).strip())
+
+        # ---------- A) LID present ----------
+        if lid_present:
+            # A1) any meaningful word overlap between LID and Concept → MATCH
+            if has_common_word(lid, concept):
+                validated_rows.append({
+                    "Line Item Description": row.get("Line Item Description"),
+                    "Concept Label": row.get("Concept Label"),
+                    "Comment Text": row.get("Comment Text"),
+                    "Dimensions": row.get("Dimensions"),
+                    "Tag Value": tag,
+                    "Validation": { "status": "MATCH", "reason": "Line Item Description matches Concept Label contextually." }
+                })
                 continue
- 
-            if not response.startswith("[") and not response.startswith("{"):
+            # else unresolved → send to LLM
+            pass_through.append(row)
+            continue
+
+        # ---------- B) LID missing ----------
+        # B1) Any URL in Dimensions → MATCH
+        if has_url(dims):
+            validated_rows.append({
+                "Line Item Description": row.get("Line Item Description"),
+                "Concept Label": row.get("Concept Label"),
+                "Comment Text": row.get("Comment Text"),
+                "Dimensions": row.get("Dimensions"),
+                "Tag Value": tag,
+                "Validation": { "status": "MATCH", "reason": "Concept Label matches Dimension contextually (dimension link present)." }
+            })
+            continue
+
+        # B2) Concept ↔ Dimensions word overlap → MATCH
+        if has_common_word(concept, dims):
+            validated_rows.append({
+                "Line Item Description": row.get("Line Item Description"),
+                "Concept Label": row.get("Concept Label"),
+                "Comment Text": row.get("Comment Text"),
+                "Dimensions": row.get("Dimensions"),
+                "Tag Value": tag,
+                "Validation": { "status": "MATCH", "reason": "Concept Label matches Dimension contextually." }
+            })
+            continue
+
+        # B3) Concept mentions date AND Tag looks like a date → MATCH
+        if "date" in concept.lower() and looks_like_date(tag_str):
+            validated_rows.append({
+                "Line Item Description": row.get("Line Item Description"),
+                "Concept Label": row.get("Concept Label"),
+                "Comment Text": row.get("Comment Text"),
+                "Dimensions": row.get("Dimensions"),
+                "Tag Value": tag,
+                "Validation": { "status": "MATCH", "reason": "Concept expects a date and Tag Value is a date." }
+            })
+            continue
+
+        # B4) Concept ↔ Tag overlap → MATCH
+        if has_common_word(concept, tag_str):
+            validated_rows.append({
+                "Line Item Description": row.get("Line Item Description"),
+                "Concept Label": row.get("Concept Label"),
+                "Comment Text": row.get("Comment Text"),
+                "Dimensions": row.get("Dimensions"),
+                "Tag Value": tag,
+                "Validation": { "status": "MATCH", "reason": "Concept Label matches Tag Value contextually." }
+            })
+            continue
+
+        # B5) Tag numeric-only with missing LID → MISSING_DATA
+        if is_numeric_only(tag_str):
+            validated_rows.append({
+                "Line Item Description": row.get("Line Item Description"),
+                "Concept Label": row.get("Concept Label"),
+                "Comment Text": row.get("Comment Text"),
+                "Dimensions": row.get("Dimensions"),
+                "Tag Value": tag,
+                "Validation": { "status": "MISSING_DATA", "reason": "Numeric-only Tag Value with missing LID." }
+            })
+            continue
+
+        # Otherwise → LLM
+        pass_through.append(row)
+
+    # ---- Send unresolved rows to LLM (existing batching kept) ----
+    for i in range(0, len(pass_through), BATCH_SIZE):
+        batch = pass_through[i:i+BATCH_SIZE]
+        user_prompt = user_prompt_template.format(data=json.dumps(batch, indent=2))
+        response = run_prompt(system_prompt, user_prompt)
+
+        try:
+            resp = response.strip()
+            if resp.startswith("```json"): resp = resp.strip("`").replace("json", "", 1).strip()
+            elif resp.startswith("```"):   resp = resp.strip("`").strip()
+            if not isinstance(resp, str) or not (resp.startswith("[") or resp.startswith("{")):
                 logging.error("LLM response is not valid JSON format")
                 validated_rows.append({"error": "Invalid JSON format from LLM"})
                 continue
- 
-            parsed_response = json.loads(response)
- 
-            # Optional: skip if it's [{}] or [{}] * n
-            if isinstance(parsed_response, list) and all(isinstance(item, dict) and not item for item in parsed_response):
-                logging.warning("Skipping empty [{}] response from LLM")
-                continue
-            logging.info(f'ROW BY ROW VALIDATION --> : {parsed_response}')
-            validated_rows.extend(parsed_response)
- 
+
+            parsed = json.loads(resp)
+            if isinstance(parsed, list):
+                validated_rows.extend(parsed)
+            else:
+                validated_rows.append(parsed)
+
         except json.JSONDecodeError as e:
             logging.error(f"JSON parsing error: {str(e)}")
             validated_rows.append({"error": f"Invalid JSON format from LLM: {str(e)}"})
- 
+
     return validated_rows
- 
+
+
 def validate_taxonomy_with_llm(taxonomy_data):
     prompts = load_prompts()
     system_prompt = prompts.get("system_prompt_taxonomy", "")  # Use separate system prompt
@@ -299,47 +435,112 @@ def validate_periods_with_llm(unique_periods, input_dates):
         logging.error(f"Period validation LLM processing error: {str(e)}")
         return [{"error": f"Period validation failed: {str(e)}"}]
  
+# def concept_label_filter(excel_rows, matched_taxonomy_blob_name):
+#     """Filter excel rows based on concept label match with taxonomy file."""
+#     try:
+#         taxonomy_bytes = get_blob_content("taxanomy", matched_taxonomy_blob_name)
+#         xls = pd.ExcelFile(io.BytesIO(taxonomy_bytes))
+ 
+#         if "Presentation" not in xls.sheet_names:
+#             logging.warning(f"'Presentation' sheet not found in {matched_taxonomy_blob_name}")
+#             return excel_rows, []
+ 
+#         presentation_df = pd.read_excel(xls, sheet_name="Presentation")
+#         if "Label" not in presentation_df.columns:
+#             logging.warning(f"'Label' column not found in Presentation sheet of {matched_taxonomy_blob_name}")
+#             return excel_rows, []
+ 
+#         labels_set = set(presentation_df["Label"].dropna().astype(str).str.strip())
+ 
+#         matched_rows = []
+#         unmatched_rows = []
+ 
+#         for row in excel_rows:
+#             concept = str(row.get("Concept Label", "")).strip()
+#             # logging.info(f"Checking CONCEPT LABEL FROM SILVER '{concept}'")
+ 
+#             if concept in labels_set:
+#                 matched_rows.append(row)
+#             else:
+#                 unmatched_rows.append(row)
+ 
+ 
+#         logging.info(f"✅ {len(matched_rows)} rows matched from {matched_taxonomy_blob_name}")
+#         # logging.info(f"{matched_rows} : MATCHED LABEL")
+ 
+#         logging.warning(f"⚠️ {len(unmatched_rows)} rows did not match in Presentation sheet from {matched_taxonomy_blob_name}")
+#         # logging.warning(f"⚠️ {unmatched_rows} : UNMATCHED LABEL")
+ 
+#         return matched_rows, unmatched_rows
+ 
+#     except Exception as e:
+#         logging.error(f"Failed concept_label_filter for {matched_taxonomy_blob_name}: {str(e)}")
+#         return excel_rows, []
+    
+
+from utils.validators import (
+    has_url, has_common_word, looks_like_date, is_numeric_only,
+    normalize_for_lookup, _close_enough
+)
+
+
 def concept_label_filter(excel_rows, matched_taxonomy_blob_name):
-    """Filter excel rows based on concept label match with taxonomy file."""
+    """Filter rows by checking if Concept Label exists (exact/alias/containment/fuzzy) in taxonomy Presentation sheet."""
     try:
         taxonomy_bytes = get_blob_content("taxanomy", matched_taxonomy_blob_name)
         xls = pd.ExcelFile(io.BytesIO(taxonomy_bytes))
- 
+
         if "Presentation" not in xls.sheet_names:
             logging.warning(f"'Presentation' sheet not found in {matched_taxonomy_blob_name}")
             return excel_rows, []
- 
+
         presentation_df = pd.read_excel(xls, sheet_name="Presentation")
         if "Label" not in presentation_df.columns:
             logging.warning(f"'Label' column not found in Presentation sheet of {matched_taxonomy_blob_name}")
             return excel_rows, []
- 
-        labels_set = set(presentation_df["Label"].dropna().astype(str).str.strip())
- 
-        matched_rows = []
-        unmatched_rows = []
- 
+
+        labels = [str(x).strip() for x in presentation_df["Label"].dropna().astype(str).tolist()]
+        labels_norm = {normalize_for_lookup(x): x for x in labels}
+
+        # Inject alias group if the canonical exists (mirrors your local validate.py logic)
+        canonical = "Equity / share capital and reserves"
+        aliases = ["Equity", "Equity share capital and reserves"]
+        c_norm = normalize_for_lookup(canonical)
+        if c_norm in labels_norm:
+            for a in aliases:
+                labels_norm[normalize_for_lookup(a)] = labels_norm[c_norm]
+
+        matched_rows, unmatched_rows = [], []
+
         for row in excel_rows:
-            concept = str(row.get("Concept Label", "")).strip()
-            # logging.info(f"Checking CONCEPT LABEL FROM SILVER '{concept}'")
- 
-            if concept in labels_set:
+            concept = str(row.get("Concept Label", "") or "").strip()
+            if not concept:
+                unmatched_rows.append(row); continue
+
+            c_norm = normalize_for_lookup(concept)
+
+            # 1) direct/alias hit
+            if c_norm in labels_norm:
+                matched_rows.append(row); continue
+
+            # 2) containment (equity in equity share capital and reserves, etc.)
+            if any(c_norm in k or k in c_norm for k in labels_norm.keys()):
+                matched_rows.append(row); continue
+
+            # 3) fuzzy
+            if any(_close_enough(c_norm, k) for k in labels_norm.keys()):
                 matched_rows.append(row)
             else:
                 unmatched_rows.append(row)
- 
- 
-        logging.info(f"✅ {len(matched_rows)} rows matched from {matched_taxonomy_blob_name}")
-        # logging.info(f"{matched_rows} : MATCHED LABEL")
- 
-        logging.warning(f"⚠️ {len(unmatched_rows)} rows did not match in Presentation sheet from {matched_taxonomy_blob_name}")
-        # logging.warning(f"⚠️ {unmatched_rows} : UNMATCHED LABEL")
- 
+
+        logging.info(f"✅ {len(matched_rows)} rows matched in Presentation (incl. fuzzy/aliases)")
+        logging.warning(f"⚠️ {len(unmatched_rows)} rows unmatched in Presentation")
         return matched_rows, unmatched_rows
- 
+
     except Exception as e:
         logging.error(f"Failed concept_label_filter for {matched_taxonomy_blob_name}: {str(e)}")
         return excel_rows, []
+
    
 def normalize_taxonomy_name(taxonomy_name: str) -> Tuple[str, str]:
     taxonomy_name = taxonomy_name.lower()
@@ -488,15 +689,27 @@ def _main_logic(req: func.HttpRequest) -> func.HttpResponse:
                     if unmatched_rows:
                         # logging.warning(f"⚠️ {len(unmatched_rows)} unmatched Concept Labels in {res['blob_name']}")
                                         # Add unmatched concept labels with validation message
+                        # for row in unmatched_rows:
+                        #     validated_data.append({
+                        #         "Concept Label": row.get("Concept Label"),
+                        #         "validation_result": [{ "status": "FLAGGED FOR REVIEW","reason": "Concept Label not found in matched taxonomy file"}]
+                        #     })
                         for row in unmatched_rows:
                             validated_data.append({
+                                "Line Item Description": row.get("Line Item Description"),
                                 "Concept Label": row.get("Concept Label"),
-                                "validation_result": [{ "status": "FLAGGED FOR REVIEW","reason": "Concept Label not found in matched taxonomy file"}]
+                                "Comment Text": row.get("Comment Text"),
+                                "Dimensions": row.get("Dimensions"),
+                                "Tag Value": row.get("Tag Value"),
+                                "Validation": {
+                                "status": "FLAGGED_FOR_REVIEW",
+                                "reason": "Concept Label not found in matched taxonomy file"}
                             })
+
  
                 else:
                     logging.warning(f"❌ No matched taxonomy file found for {res['blob_name']}. Sending all rows to LLM.")
-                    # validated_data.extend(validate_with_llm(res["excel_rows"]))
+                    validated_data.extend(validate_with_llm(res["excel_rows"]))
 
     # Validate JSON
     try:
