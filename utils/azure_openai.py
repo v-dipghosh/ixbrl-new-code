@@ -5,7 +5,7 @@ from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 
 OPENAI_API_KEY = "23f5ceda179a44a694ccfa205fd34cb3"
 OPENAI_API_BASE = "https://swcdoai3bmaoa01.openai.azure.com/"
-OPENAI_MODEL = "gpt-4o"
+OPENAI_MODEL = "gpt-4.1"
 OPENAI_API_VERSION = "2024-12-01-preview"
 OPENAI_API_EMBEDDING_MODEL = "text-embedding-ada-002"
 
