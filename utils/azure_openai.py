@@ -5,7 +5,7 @@ from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 
 OPENAI_API_KEY = "23f5ceda179a44a694ccfa205fd34cb3"
 OPENAI_API_BASE = "https://swcdoai3bmaoa01.openai.azure.com/"
-OPENAI_MODEL = "gpt-4.1"
+OPENAI_MODEL = "gpt-4o"
 OPENAI_API_VERSION = "2024-12-01-preview"
 OPENAI_API_EMBEDDING_MODEL = "text-embedding-ada-002"
 
@@ -50,11 +50,23 @@ def run_prompt(prompt,system_prompt):
         azure_endpoint =OPENAI_API_BASE
     )
 
-    
+    # response = openai_client.chat.completions.create(
+    #     model=OPENAI_MODEL,
+    #     messages=[{ "role": "system", "content": system_prompt},
+    #           {"role":"user","content":prompt}])
+
     response = openai_client.chat.completions.create(
         model=OPENAI_MODEL,
-        messages=[{ "role": "system", "content": system_prompt},
-              {"role":"user","content":prompt}])
+        temperature=0,           # <= deterministic
+        top_p=0,                 # <= deterministic
+        # If your AOAI deployment supports it (gpt-4o), keep this:
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt},
+        ],
+    )
+ 
     
     return response.choices[0].message.content
 

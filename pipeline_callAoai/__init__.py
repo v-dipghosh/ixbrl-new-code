@@ -13,9 +13,46 @@ from bs4 import BeautifulSoup
 from datetime import datetime, timezone
 import Levenshtein
 from typing import Tuple
+from string import Template
+
+
+import logging, traceback
+
+logging.getLogger().setLevel(logging.INFO)
+ 
+try:
+
+    logging.warning("module import: started")
+
+    # ← keep your other imports/defs here
+
+    logging.warning("module import: OK")
+
+except Exception as e:
+
+    logging.error("module import FAILED: %s\n%s", e, traceback.format_exc())
+
+    raise
+
+ 
+
+REQUIRED_CONTEXT_KEYS = [
+
+    "Line Item Description",  # LID
+
+    "Concept Label",
+
+    "Comment Text",
+
+    "Dimensions",
+
+    "Tag Value",
+
+]
+ 
  
 # Define batch size (adjust based on LLM token limits)
-BATCH_SIZE = 10
+BATCH_SIZE = 5
  
 def process_blob(blob):
     """Extract relevant Excel content for LLM validation."""
@@ -45,9 +82,47 @@ def process_blob(blob):
             # # Extract required columns
             # df = df[['Line Item Description', 'Concept Label', 'Comment Text']].dropna(how='all')
             df_filing_details = pd.read_excel(xls, sheet_name='Filing Details')
+
+            # --- Column normalization (case/space/Unicode tolerant) ---
+
+            def _canon(x: str) -> str:
+                s = str(x or "")
+                # normalize funny unicode quotes/dashes/spaces
+                s = (s.replace("’", "'")
+                    .replace("–", "-")
+                    .replace("—", "-")
+                    .replace("\u00A0", " "))
+                s = re.sub(r"\s+", " ", s).strip().lower()
+                return s
+            alias_map = {"line item description":"Line Item Description",
+                        "concept label":"Concept Label","comment text":"Comment Text",
+                        "dimensions":"Dimensions","tag value":"Tag Value",}
+            rename = {}
+            for c in list(df_filing_details.columns):
+                key = _canon(c)
+                if key in alias_map:
+                    rename[c] = alias_map[key]
+            if rename:
+                df_filing_details = df_filing_details.rename(columns=rename)
+ 
+            logging.info("Filing Details columns (normalized): %s", list(df_filing_details.columns))
  
             # Extract relevant columns for LLM validation
-            df = df_filing_details[['Line Item Description', 'Concept Label', 'Comment Text','Dimensions','Tag Value']].dropna(how='all')
+            # df = df_filing_details[['Line Item Description', 'Concept Label', 'Comment Text','Dimensions','Tag Value']].dropna(how='all')
+            # Extract relevant columns for LLM validation (tolerate missing columns)
+
+            required_cols = ["Line Item Description", "Concept Label", "Comment Text", "Dimensions", "Tag Value"]
+            available = [c for c in required_cols if c in df_filing_details.columns]
+            df = df_filing_details[available].copy()  # select only what exists
+        # add any missing columns as empty strings
+            for c in required_cols:
+                if c not in df.columns:
+                    df[c] = ""
+        # reorder to our canonical schema
+            df = df[required_cols]
+        # optional: drop rows that are entirely empty across our required columns
+            df = df.replace("", pd.NA).dropna(how="all").fillna("")
+
  
             # Extract unique 'Period' values
             if 'Period' in df_filing_details.columns:
@@ -192,57 +267,86 @@ def batch_rows(rows, batch_size):
     """Split rows into smaller batches."""
     for i in range(0, len(rows), batch_size):
         yield rows[i:i + batch_size]
- 
-# def validate_with_llm(rows):
-#     """Send batches of rows to LLM for validation."""
-#     validated_rows = []
-#     prompts = load_prompts()  
-#     system_prompt = prompts["system_prompt"]
-#     user_prompt_template = prompts["user_prompt"]  
- 
-#     for batch in batch_rows(rows, BATCH_SIZE):
-#         # Use the user prompt from backend instead of constructing it manually
-#         user_prompt = user_prompt_template.format(data=json.dumps(batch, indent=2))
- 
-#         response = run_prompt(system_prompt, user_prompt)
-#         try:
-#             response = response.strip()
- 
-#             # Handle Markdown formatting from LLM like ```json ... ```
-#             if response.startswith("```json"):
-#                 response = response.strip("`").replace("json", "", 1).strip()
-#             elif response.startswith("```"):
-#                 response = response.strip("`").strip()
- 
-#             # Ensure it's still a string before proceeding
-#             if not isinstance(response, str):
-#                 logging.error("LLM response is not a valid string.")
-#                 validated_rows.append({"error": "Invalid LLM response type"})
-#                 continue
- 
-#             if not response.startswith("[") and not response.startswith("{"):
-#                 logging.error("LLM response is not valid JSON format")
-#                 validated_rows.append({"error": "Invalid JSON format from LLM"})
-#                 continue
- 
-#             parsed_response = json.loads(response)
- 
-#             # Optional: skip if it's [{}] or [{}] * n
-#             if isinstance(parsed_response, list) and all(isinstance(item, dict) and not item for item in parsed_response):
-#                 logging.warning("Skipping empty [{}] response from LLM")
-#                 continue
-#             logging.info(f'ROW BY ROW VALIDATION --> : {parsed_response}')
-#             validated_rows.extend(parsed_response)
- 
-#         except json.JSONDecodeError as e:
-#             logging.error(f"JSON parsing error: {str(e)}")
-#             validated_rows.append({"error": f"Invalid JSON format from LLM: {str(e)}"})
- 
-#     return validated_rows
 
-# from utils.validators import (
-#     has_url, has_common_word, looks_like_date, is_numeric_only
-# )
+def _clean(v: object) -> str:
+
+    """Return '' for None/NaN, else a safe string."""
+
+    try:
+
+        if v is None:
+
+            return ""
+
+        # pd.isna handles numpy.nan and pandas NA types
+
+        if pd.isna(v):  # pandas already imported as pd in your file
+
+            return ""
+
+    except Exception:
+
+        pass
+
+    return str(v)
+ 
+ 
+def _normalize_llm_item_with_context(llm_obj: dict, src_row: dict) -> dict:
+
+    """
+
+    Keep all row context from the source row (Excel/filing).
+
+    Use LLM only for Validation.status/reason.
+
+    If LLM omits them, default to FLAGGED_FOR_REVIEW with a clear reason.
+
+    Also convert NaN/None to '' so we never emit literal 'nan'.
+
+    """
+
+    llm_obj = llm_obj or {}
+ 
+    validation = llm_obj.get("Validation") or {}
+
+    status = (llm_obj.get("status") or validation.get("status") or "").strip()
+
+    reason = (llm_obj.get("reason") or validation.get("reason") or "").strip()
+ 
+    # Fallback if the model didn't give us a verdict
+
+    if not status:
+
+        status = "FLAGGED_FOR_REVIEW"
+
+        if not reason:
+
+            reason = "Model omitted a verdict; defaulted to review."
+ 
+    return {
+
+        "Line Item Description": _clean(src_row.get("Line Item Description")),
+
+        "Concept Label":         _clean(src_row.get("Concept Label")),
+
+        "Comment Text":          _clean(src_row.get("Comment Text")),
+
+        "Dimensions":            _clean(src_row.get("Dimensions")),
+
+        "Tag Value":             _clean(src_row.get("Tag Value")),
+
+        "Validation": {
+
+            "status": status,
+
+            "reason": reason,
+
+        },
+
+    }
+
+ 
+
 
 def validate_with_llm(rows):
     """
@@ -251,6 +355,16 @@ def validate_with_llm(rows):
       keys: "Line Item Description", "Concept label", "Comment Text", "Dimensions", "Tag Value",
             "Validation": {"status": "<MATCH|MISSING_DATA|FLAGGED_FOR_REVIEW>", "reason": "..."}
     """
+    # Accept None or a single dict safely
+
+    if rows is None:
+
+        rows = []
+
+    elif not isinstance(rows, list):
+
+        rows = [rows]
+
     validated_rows = []
     pass_through = []
 
@@ -258,7 +372,7 @@ def validate_with_llm(rows):
     system_prompt = prompts["system_prompt"]
     user_prompt_template = prompts["user_prompt"]
 
-    for row in rows:
+    for idx, row in enumerate(rows):
         concept = row.get("Concept Label") or ""
         lid     = row.get("Line Item Description") or ""
         dims    = row.get("Dimensions") or ""
@@ -281,8 +395,12 @@ def validate_with_llm(rows):
                 })
                 continue
             # else unresolved → send to LLM
-            pass_through.append(row)
+            row_with_id = dict(row)          # shallow copy so we don't mutate the original
+            row_with_id["__row_id"] = idx    # <-- attach stable id
+            pass_through.append(row_with_id)
             continue
+
+ 
 
         # ---------- B) LID missing ----------
         # B1) Any URL in Dimensions → MATCH
@@ -346,32 +464,169 @@ def validate_with_llm(rows):
             continue
 
         # Otherwise → LLM
-        pass_through.append(row)
+        row_with_id = dict(row) 
+        row_with_id["__row_id"] = idx
+        pass_through.append(row_with_id)
+        continue
 
     # ---- Send unresolved rows to LLM (existing batching kept) ----
+    # ---- Send unresolved rows to LLM (existing batching kept) ----
+
     for i in range(0, len(pass_through), BATCH_SIZE):
-        batch = pass_through[i:i+BATCH_SIZE]
-        user_prompt = user_prompt_template.format(data=json.dumps(batch, indent=2))
+        raw_batch = pass_through[i:i+BATCH_SIZE]
+        # Add a per-row id the model must echo back
+        batch =[]
+        for j, row in enumerate(raw_batch):
+            r = dict(row)
+            r["__row_id"] = j  # id is only within this batch
+            batch.append(r)
+
+        user_prompt = user_prompt_template.replace("{data}", json.dumps(batch, indent=2))
+    # Call your AOAI wrapper
         response = run_prompt(system_prompt, user_prompt)
 
+    # Make sure we have a string to parse
+        if isinstance(response, str):
+            resp_text = response
+        else:
+        # If your run_prompt returns an SDK object, try to pull text content
+            try:
+                resp_text = response.choices[0].message.content
+            except Exception:
+
+            # Last resort: stringify
+
+                resp_text = str(response)
+ 
+    # Clean common code-fence wrappers
+
+        resp_text = resp_text.strip()
+
+        if resp_text.startswith("```json"):
+
+            resp_text = resp_text[len("```json"):].strip().strip("`").strip()
+
+        elif resp_text.startswith("```"):
+
+            resp_text = resp_text.strip("`").strip()
+ 
+    # Basic sanity check
+
+        if not (resp_text.startswith("[") or resp_text.startswith("{")):
+            logging.error("LLM response is not valid JSON format: preview=%r", resp_text[:200])
+            validated_rows.append({"error": "Invalid JSON format from LLM"})
+            continue
+        
+        # Helpful preview so we can see what the model sent
+
+        logging.info("LLM response preview: %r", resp_text[:300])
+ 
+        # 1) Parse JSON safely
+
         try:
-            resp = response.strip()
-            if resp.startswith("```json"): resp = resp.strip("`").replace("json", "", 1).strip()
-            elif resp.startswith("```"):   resp = resp.strip("`").strip()
-            if not isinstance(resp, str) or not (resp.startswith("[") or resp.startswith("{")):
-                logging.error("LLM response is not valid JSON format")
-                validated_rows.append({"error": "Invalid JSON format from LLM"})
-                continue
 
-            parsed = json.loads(resp)
-            if isinstance(parsed, list):
-                validated_rows.extend(parsed)
+            parsed = json.loads(resp_text)
+
+        except Exception as e:
+
+            logging.error("json.loads failed: %s | preview=%r", e, resp_text[:300])
+
+            validated_rows.append({"error": f"Invalid JSON from LLM: {str(e)}"})
+
+            continue
+ 
+        # 2) Normalize ANY valid shape into a list we can iterate
+
+        if parsed is None:
+
+            logging.error("LLM returned JSON null; skipping this batch. preview=%r", resp_text[:200])
+
+            continue
+ 
+        parsed_list = None
+
+        if isinstance(parsed, list):
+
+            parsed_list = parsed
+
+        elif isinstance(parsed, dict):
+
+            items = parsed.get("items")  # safe .get
+
+            if isinstance(items, list):
+
+                parsed_list = items
+
             else:
-                validated_rows.append(parsed)
 
-        except json.JSONDecodeError as e:
-            logging.error(f"JSON parsing error: {str(e)}")
-            validated_rows.append({"error": f"Invalid JSON format from LLM: {str(e)}"})
+        # treat single object as list of one
+
+                parsed_list = [parsed]
+
+        else:
+
+            logging.error("LLM returned unexpected JSON type %s; preview=%r", type(parsed), resp_text[:200])
+
+            validated_rows.append({"error": "Unexpected JSON type from LLM"})
+
+            continue
+ 
+        by_id = {}
+        if isinstance(parsed_list, list):
+            for it in parsed_list:
+                if isinstance(it, dict) and "__row_id" in it:
+                    by_id[it["__row_id"]] = it
+        if not by_id and isinstance(parsed_list, list):
+            for pos, it in enumerate(parsed_list):
+                if isinstance(it, dict):
+                    by_id[pos] = it
+        
+        logging.info("parsed type=%s | parsed_list type=%s",type(parsed).__name__, type(parsed_list).__name__)
+ 
+        for j in range(len(batch)):
+            try:
+                src = batch[j]
+                row_id = src.get("__row_id", j)
+                item = by_id.get(row_id)
+
+                if not item:
+                    single_user_prompt = user_prompt_template.replace("{data}", json.dumps([src], indent=2))
+                    single_resp = run_prompt(system_prompt, single_user_prompt)
+                    single_txt = single_resp if isinstance(single_resp, str) else getattr(single_resp.choices[0].message, "content", str(single_resp))
+                    single_txt = single_txt.strip()
+                    if single_txt.startswith("```json"):
+                        single_txt = single_txt[len("```json"):].strip().strip("`").strip()
+                    elif single_txt.startswith("```"):
+                        single_txt = single_txt.strip("`").strip()
+
+                    try:
+                        single_parsed = json.loads(single_txt)
+                        if isinstance(single_parsed, list) and single_parsed and isinstance(single_parsed[0], dict):
+                            item = single_parsed[0]
+                        elif isinstance(single_parsed, dict):
+                            item = single_parsed
+                    except Exception:
+                        item = None
+                if not item:
+                    item = {"Validation": {
+                        "status": "FLAGGED_FOR_REVIEW",
+                        "reason": "Model omitted this row in batch and retry; defaulted."
+                    }}
+                normalized = _normalize_llm_item_with_context(item, src)
+
+                if not all(normalized.get(k, "") for k in REQUIRED_CONTEXT_KEYS):
+                    logging.warning("Context fields missing; normalized record: %r", normalized)
+
+                validated_rows.append(normalized)
+
+            except Exception as e:
+                logging.error("Failed to process row %d: %s", j, e)
+                validated_rows.append(_normalize_llm_item_with_context({"Validation": {"status": "FLAGGED_FOR_REVIEW",
+                                "reason": f"Post-process error: {e}"}},
+                                batch[j]
+                    )
+                )
+                continue
 
     return validated_rows
 
@@ -383,7 +638,8 @@ def validate_taxonomy_with_llm(taxonomy_data):
  
     try:
         # logging.info(f"TAXANOMY DATA:  {taxonomy_data}")
-        user_prompt = taxonomy_prompt.format(data=json.dumps(taxonomy_data, indent=2))
+        user_prompt = Template(taxonomy_prompt).safe_substitute(data=json.dumps(taxonomy_data, indent=2))
+ 
         # logging.info(f'HTML --> {user_prompt}')
  
         response = run_prompt(system_prompt, user_prompt).strip()
@@ -411,11 +667,10 @@ def validate_periods_with_llm(unique_periods, input_dates):
     user_prompt_template = prompts.get("user_prompt_period_validation", "")
  
     try:
-        user_prompt = user_prompt_template.format(
-            periods=json.dumps(unique_periods, indent=2),
-            input_dates=json.dumps(input_dates, indent=2)
-        )
- 
+        user_prompt = user_prompt_template
+        user_prompt = user_prompt.replace("{periods}", json.dumps(unique_periods, indent=2))
+        user_prompt = user_prompt.replace("{input_dates}", json.dumps(input_dates, indent=2))
+
         response = run_prompt(system_prompt, user_prompt).strip()
         logging.info(f'PERIOD VALIDATION LLM RESPONSE: {response}')
  
@@ -434,49 +689,7 @@ def validate_periods_with_llm(unique_periods, input_dates):
     except Exception as e:
         logging.error(f"Period validation LLM processing error: {str(e)}")
         return [{"error": f"Period validation failed: {str(e)}"}]
- 
-# def concept_label_filter(excel_rows, matched_taxonomy_blob_name):
-#     """Filter excel rows based on concept label match with taxonomy file."""
-#     try:
-#         taxonomy_bytes = get_blob_content("taxanomy", matched_taxonomy_blob_name)
-#         xls = pd.ExcelFile(io.BytesIO(taxonomy_bytes))
- 
-#         if "Presentation" not in xls.sheet_names:
-#             logging.warning(f"'Presentation' sheet not found in {matched_taxonomy_blob_name}")
-#             return excel_rows, []
- 
-#         presentation_df = pd.read_excel(xls, sheet_name="Presentation")
-#         if "Label" not in presentation_df.columns:
-#             logging.warning(f"'Label' column not found in Presentation sheet of {matched_taxonomy_blob_name}")
-#             return excel_rows, []
- 
-#         labels_set = set(presentation_df["Label"].dropna().astype(str).str.strip())
- 
-#         matched_rows = []
-#         unmatched_rows = []
- 
-#         for row in excel_rows:
-#             concept = str(row.get("Concept Label", "")).strip()
-#             # logging.info(f"Checking CONCEPT LABEL FROM SILVER '{concept}'")
- 
-#             if concept in labels_set:
-#                 matched_rows.append(row)
-#             else:
-#                 unmatched_rows.append(row)
- 
- 
-#         logging.info(f"✅ {len(matched_rows)} rows matched from {matched_taxonomy_blob_name}")
-#         # logging.info(f"{matched_rows} : MATCHED LABEL")
- 
-#         logging.warning(f"⚠️ {len(unmatched_rows)} rows did not match in Presentation sheet from {matched_taxonomy_blob_name}")
-#         # logging.warning(f"⚠️ {unmatched_rows} : UNMATCHED LABEL")
- 
-#         return matched_rows, unmatched_rows
- 
-#     except Exception as e:
-#         logging.error(f"Failed concept_label_filter for {matched_taxonomy_blob_name}: {str(e)}")
-#         return excel_rows, []
-    
+   
 
 from utils.validators import (
     has_url, has_common_word, looks_like_date, is_numeric_only,
@@ -747,11 +960,15 @@ def _main_logic(req: func.HttpRequest) -> func.HttpResponse:
  
 def main(req: func.HttpRequest) -> func.HttpResponse:
     try:
+        logging.info("main(): entered")
         return _main_logic(req)
     except Exception as e:
-        logging.error(f"Fatal error in main: {str(e)}")
+        import traceback
+        logging.error("Fatal error in main: %s\n%s", e, traceback.format_exc())
         return func.HttpResponse(
             json.dumps({"error": str(e)}),
             status_code=500,
             mimetype="application/json"
-)
+        )
+
+ 
